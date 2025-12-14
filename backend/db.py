@@ -3,7 +3,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 # 1. CREDENTIALS
 DB_USER = "root"
-DB_PASS = "admin123"
+DB_PASS = "pass123"
 DB_HOST = "127.0.0.1"
 DB_PORT = 3306
 DB_NAME = "job_trends"

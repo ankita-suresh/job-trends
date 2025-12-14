@@ -6,7 +6,7 @@ import models
 
 # --- CONFIGURATION ---
 # Update this path if your CSV is in a different location
-CSV_FILE = r"C:\Users\Krishi Thiruppathi\Downloads\jobs_data.csv"
+CSV_FILE = r"C:\Users\HP\Downloads\jobs_in_data.csv"
 
 # MAPPINGS
 EXP_MAP = {'SE': 'Senior', 'MI': 'Mid-level', 'EN': 'Entry-level', 'EX': 'Executive'}

@@ -6,6 +6,7 @@ const BASE = "http://127.0.0.1:8000";
 const MAX_FETCH = 10000;
 
 // Candidate keys (case-insensitive attempts)
+
 const CANDIDATES = {
   salary: ["Salary_USD", "salary_usd", "salaryInUSD", "salary_in_usd", "salary", "Salary"],
   employment: ["Employment_Type", "employment_type", "employmentType", "EmploymentType", "employment"],
