@@ -1,511 +1,550 @@
-import React, { useEffect, useRef, useState } from "react";
-import * as d3 from "d3";
-import "./analytics-d3.css"; // Make sure to create this CSS file
+import React, { useState } from "react";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import "./analytics-d3.css";
 
-const BASE = "http://127.0.0.1:8000";
-const MAX_FETCH = 10000;
+const BASE_URL = "http://127.0.0.1:8000";
 
-// Candidate keys (case-insensitive attempts)
-const CANDIDATES = {
-  salary: ["Salary_USD", "salary_usd", "salaryInUSD", "salary_in_usd", "salary", "Salary"],
-  employment: ["Employment_Type", "employment_type", "employmentType", "EmploymentType", "employment"],
-  location: ["Location", "location", "company_location", "companyLocation", "Company", "employee_residence", "employeeResidence"],
-  role: ["Job_Role", "job_role", "Job_Title", "job_title", "title", "Role"] // <-- ADDED
-};
-
-function pickField(obj, candidates) {
-  if (!obj) return null;
-  const keys = Object.keys(obj);
-  const lowerKeys = keys.reduce((acc, k) => { acc[k.toLowerCase()] = k; return acc; }, {});
-  for (let c of candidates) {
-    const lower = c.toLowerCase();
-    if (lowerKeys[lower]) return lowerKeys[lower]; // return actual key name present in object
-  }
-  // fallback: if object has obvious keys
-  for (let k of ["salary", "employment", "location", "role"]) {
-    if (lowerKeys[k]) return lowerKeys[k];
-  }
-  return null;
-}
-
-// fetch jobs (single call). We use skip=0&limit=MAX_FETCH
-async function fetchJobs(limit = MAX_FETCH) {
-  const url = `${BASE}/jobs?skip=0&limit=${limit}`;
-  const res = await fetch(url, { credentials: "include" });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Fetch failed ${res.status}: ${text}`);
-  }
-  const jobs = await res.json();
-  if (!Array.isArray(jobs)) throw new Error("Unexpected response shape from /jobs (expected array)");
-  return jobs;
-}
-
-// --- Aggregation Helpers ---
-
-// Aggregates by key and returns counts
-function aggregateCounts(arr, key) {
-  const counts = new Map();
-  for (const r of arr) {
-    let v = r[key];
-    if (v === null || v === undefined || v === "") v = "Unknown";
-    counts.set(v, (counts.get(v) || 0) + 1);
-  }
-  // REFACTORED: Use 'value' instead of 'count'
-  const out = [...counts.entries()].map(([label, count]) => ({ label, value: count }));
-  out.sort((a,b)=>b.value-a.value); // Sort by 'value'
-  return out;
-}
-
-// NEW: Aggregates by key and returns average salary
-function aggregateAverageSalary(arr, keyField, salaryField) {
-  const stats = new Map();
-  const salaryKey = salaryField;
-  const groupKey = keyField;
-
-  if (!groupKey || !salaryKey) return [];
-
-  for (const r of arr) {
-    let group = r[groupKey];
-    if (group === null || group === undefined || group === "") group = "Unknown";
-    
-    const val = numeric(r[salaryKey]);
-    if (Number.isNaN(val) || !Number.isFinite(val)) continue;
-
-    const current = stats.get(group) || { sum: 0, count: 0 };
-    stats.set(group, {
-      sum: current.sum + val,
-      count: current.count + 1,
-    });
-  }
-
-  const out = [];
-  for (const [label, data] of stats.entries()) {
-    if (data.count > 0) {
-      out.push({
-        label,
-        value: data.sum / data.count, // 'value' is our average salary
-        count: data.count // keep 'count' for tooltips or filtering
-      });
-    }
-  }
-  
-  out.sort((a,b)=>b.value-a.value); // Sort by highest average salary
-  return out;
-}
-
-function numeric(x) {
-  if (x === null || x === undefined) return NaN;
-  if (typeof x === "number") return x;
-  const s = String(x).replace(/[^0-9.\-]/g,""); // strip currency symbols, commas
-  return Number(s);
-}
-
-// Main component
-export default function Analytics3D() {
-  const [status, setStatus] = useState("idle"); // idle | loading | ready | error
+export default function JobSpecificAnalytics() {
+  const [searchTerm, setSearchTerm] = useState("");
+  const [startYear, setStartYear] = useState(2020);
+  const [endYear, setEndYear] = useState(2024);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [jobs, setJobs] = useState([]);
-  const [fields, setFields] = useState({ 
-    salary: null, 
-    employment: null, 
-    location: null, 
-    role: null // <-- ADDED
-  });
+  const [results, setResults] = useState(null);
 
-  // Refs for SVG containers
-  const donutRef = useRef();
-  const barRef = useRef();
-  const histRef = useRef();
+  const handleAnalyze = async () => {
+    if (!searchTerm.trim()) {
+      alert("Please enter a job title or keywords");
+      return;
+    }
 
-  // --- Data Fetching Effect ---
-  useEffect(() => {
-    let mounted = true;
-    setStatus("loading");
+    setLoading(true);
     setError(null);
+    setResults(null);
 
-    (async () => {
-      try {
-        const data = await fetchJobs(MAX_FETCH);
-        if (!mounted) return;
-        setJobs(data);
-
-        // auto-detect fields from first non-empty row
-        let sample = data.find(Boolean) || {};
-        const salaryKey = pickField(sample, CANDIDATES.salary);
-        const empKey = pickField(sample, CANDIDATES.employment);
-        const locKey = pickField(sample, CANDIDATES.location);
-        const roleKey = pickField(sample, CANDIDATES.role); // <-- ADDED
-
-        setFields({ 
-          salary: salaryKey, 
-          employment: empKey, 
-          location: locKey, 
-          role: roleKey // <-- ADDED
-        });
-        setStatus("ready");
-      } catch (err) {
-        if (!mounted) return;
-        setError(err.message || String(err));
-        setStatus("error");
-      }
-    })();
-
-    return () => { mounted = false };
-  }, []);
-
-  // --- Drawing Effect ---
-  useEffect(() => {
-    if (status !== "ready") return;
-
-    // employment donut
     try {
-      const empKey = fields.employment;
-      const empData = empKey ? aggregateCounts(jobs, empKey) : [];
-      drawDonut(donutRef, empData, { title: "Employment type" });
-    } catch (e) {
-      console.error("donut draw err", e);
-    }
-
-    // Avg Salary by Job Role bar
-    try {
-      const roleKey = fields.role;
-      const salaryKey = fields.salary;
-      // Use our new function!
-      const salaryData = aggregateAverageSalary(jobs, roleKey, salaryKey).slice(0, 12); // Get top 12
+      // Fetch all jobs matching the search term
+      const response = await fetch(`${BASE_URL}/jobs?limit=10000`);
+      if (!response.ok) throw new Error("Failed to fetch jobs");
       
-      // Use the same bar drawing function!
-      drawHorizontalBar(barRef.current, salaryData, { title: "Average Salary by Job Role (Top 12)" });
-    } catch (e) {
-      console.error("bar draw err", e);
-    }
+      const allJobs = await response.json();
+      
+      // Filter jobs by search term and year range
+      const searchLower = searchTerm.toLowerCase();
+      const filteredJobs = allJobs.filter(job => {
+        const titleMatch = job.job_title?.toLowerCase().includes(searchLower);
+        const yearMatch = job.work_year >= startYear && job.work_year <= endYear;
+        return titleMatch && yearMatch;
+      });
 
-    // salary histogram
-    try {
-      const salaryKey = fields.salary;
-      const vals = [];
-      if (salaryKey) {
-        for (const r of jobs) {
-          const n = numeric(r[salaryKey]);
-          if (!Number.isNaN(n) && Number.isFinite(n)) vals.push(n);
-        }
+      if (filteredJobs.length === 0) {
+        setError(`No jobs found matching "${searchTerm}" between ${startYear}-${endYear}`);
+        setLoading(false);
+        return;
       }
-      drawHistogram(histRef.current, vals, { title: "Salary distribution (USD)", buckets: 20 });
-    } catch (e) {
-      console.error("hist draw err", e);
+
+      // Calculate trend data by year
+      const trendByYear = {};
+      filteredJobs.forEach(job => {
+        const year = job.work_year || 2024;
+        if (!trendByYear[year]) {
+          trendByYear[year] = {
+            year,
+            count: 0,
+            totalSalary: 0,
+            salaries: []
+          };
+        }
+        trendByYear[year].count += 1;
+        if (job.min_salary) {
+          trendByYear[year].totalSalary += job.min_salary;
+          trendByYear[year].salaries.push(job.min_salary);
+        }
+      });
+
+      // Calculate averages and format trend data
+      const trendData = Object.values(trendByYear).map(yearData => ({
+        year: yearData.year,
+        count: yearData.count,
+        avgSalary: yearData.salaries.length > 0 
+          ? Math.round(yearData.totalSalary / yearData.salaries.length)
+          : 0,
+        minSalary: yearData.salaries.length > 0 ? Math.min(...yearData.salaries) : 0,
+        maxSalary: yearData.salaries.length > 0 ? Math.max(...yearData.salaries) : 0
+      })).sort((a, b) => a.year - b.year);
+
+      // Calculate overall statistics
+      const allSalaries = filteredJobs
+        .map(j => j.min_salary)
+        .filter(s => s && s > 0);
+      
+      const stats = {
+        totalJobs: filteredJobs.length,
+        avgSalary: allSalaries.length > 0 
+          ? Math.round(allSalaries.reduce((a, b) => a + b, 0) / allSalaries.length)
+          : 0,
+        minSalary: allSalaries.length > 0 ? Math.min(...allSalaries) : 0,
+        maxSalary: allSalaries.length > 0 ? Math.max(...allSalaries) : 0,
+        uniqueLocations: new Set(filteredJobs.map(j => j.location)).size,
+        uniqueCompanies: new Set(filteredJobs.map(j => j.company?.company_name).filter(Boolean)).size
+      };
+
+      setResults({
+        jobs: filteredJobs,
+        trendData,
+        stats
+      });
+      setLoading(false);
+
+    } catch (err) {
+      console.error("Error:", err);
+      setError(err.message || "Failed to fetch data");
+      setLoading(false);
     }
+  };
 
-  }, [status, jobs, fields]);
-
-  // --- Render ---
   return (
-    <div className="analytics-3d-wrap">
-      <header className="analytics-header">
-        <h2>Analytics — Jobs</h2>
-        <div className="summary">
-          <div><strong>Total fetched:</strong> {jobs.length}</div>
-          <div><strong>Detected fields:</strong>
-            <small> salary: <em>{fields.salary || "none"}</em>,</small>
-            <small> employment: <em>{fields.employment || "none"}</em>,</small>
-            <small> location: <em>{fields.location || "none"}</em>,</small>
-            <small> role: <em>{fields.role || "none"}</em></small>
+    <div style={{ padding: '2rem', background: '#f5f7fa', minHeight: '100vh' }}>
+      <div style={{ maxWidth: '1400px', margin: '0 auto' }}>
+        
+        {/* Header */}
+        <div style={{ 
+          background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+          padding: '2rem',
+          borderRadius: '16px',
+          marginBottom: '2rem',
+          color: 'white',
+          boxShadow: '0 10px 30px rgba(0,0,0,0.2)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginBottom: '0.5rem' }}>
+            <span style={{ fontSize: '2.5rem' }}>🔍</span>
+            <h1 style={{ margin: 0, fontSize: '2rem' }}>Job-Specific Analytics</h1>
+          </div>
+          <p style={{ margin: '0.5rem 0 0 0', opacity: 0.9 }}>
+            Search and analyze specific job titles over time • {results?.stats.totalJobs || 0} jobs available
+          </p>
+        </div>
+
+        {/* Search Criteria Card */}
+        <div style={{
+          background: 'white',
+          padding: '2rem',
+          borderRadius: '16px',
+          marginBottom: '2rem',
+          boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.5rem' }}>
+            <span style={{ fontSize: '1.5rem' }}>🎯</span>
+            <h2 style={{ margin: 0, color: '#2c3e50', fontSize: '1.3rem' }}>Search Criteria</h2>
+          </div>
+
+          <div style={{ display: 'grid', gap: '1.5rem' }}>
+            {/* Job Title Search */}
+            <div>
+              <label style={{ 
+                display: 'block', 
+                marginBottom: '0.5rem', 
+                fontWeight: 600, 
+                color: '#34495e',
+                fontSize: '0.95rem'
+              }}>
+                Job Title or Keywords
+              </label>
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder="e.g., Data Scientist, Engineer, Manager..."
+                onKeyPress={(e) => e.key === 'Enter' && handleAnalyze()}
+                style={{
+                  width: '100%',
+                  padding: '0.875rem',
+                  border: '2px solid #e0e6ed',
+                  borderRadius: '12px',
+                  fontSize: '1rem',
+                  transition: 'all 0.3s ease'
+                }}
+                onFocus={(e) => e.target.style.borderColor = '#667eea'}
+                onBlur={(e) => e.target.style.borderColor = '#e0e6ed'}
+              />
+            </div>
+
+            {/* Year Range */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div>
+                <label style={{ 
+                  display: 'block', 
+                  marginBottom: '0.5rem', 
+                  fontWeight: 600, 
+                  color: '#34495e',
+                  fontSize: '0.95rem'
+                }}>
+                  Start Year (Optional)
+                </label>
+                <input
+                  type="number"
+                  value={startYear}
+                  onChange={(e) => setStartYear(parseInt(e.target.value))}
+                  min="2020"
+                  max="2024"
+                  style={{
+                    width: '100%',
+                    padding: '0.875rem',
+                    border: '2px solid #e0e6ed',
+                    borderRadius: '12px',
+                    fontSize: '1rem'
+                  }}
+                />
+              </div>
+              <div>
+                <label style={{ 
+                  display: 'block', 
+                  marginBottom: '0.5rem', 
+                  fontWeight: 600, 
+                  color: '#34495e',
+                  fontSize: '0.95rem'
+                }}>
+                  End Year (Optional)
+                </label>
+                <input
+                  type="number"
+                  value={endYear}
+                  onChange={(e) => setEndYear(parseInt(e.target.value))}
+                  min="2020"
+                  max="2024"
+                  style={{
+                    width: '100%',
+                    padding: '0.875rem',
+                    border: '2px solid #e0e6ed',
+                    borderRadius: '12px',
+                    fontSize: '1rem'
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Analyze Button */}
+            <button
+              onClick={handleAnalyze}
+              disabled={loading}
+              style={{
+                background: loading ? '#95a5a6' : 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                color: 'white',
+                padding: '1rem 2rem',
+                border: 'none',
+                borderRadius: '12px',
+                fontSize: '1.1rem',
+                fontWeight: 600,
+                cursor: loading ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '0.75rem',
+                boxShadow: '0 4px 12px rgba(102, 126, 234, 0.4)',
+                transition: 'all 0.3s ease'
+              }}
+              onMouseEnter={(e) => !loading && (e.target.style.transform = 'translateY(-2px)')}
+              onMouseLeave={(e) => e.target.style.transform = 'translateY(0)'}
+            >
+              <span style={{ fontSize: '1.3rem' }}>📊</span>
+              {loading ? 'Analyzing...' : 'Analyze Job Trends'}
+            </button>
           </div>
         </div>
-      </header>
 
-      {status === "loading" && <div className="loading">Loading jobs and building charts…</div>}
-      {status === "error" && <div className="err">Error: {error}</div>}
-
-      {status === "ready" && (
-        <div className="dashboard-grid">
-          <div className="card donut-card">
-            <h3>Employment Type</h3>
-            {fields.employment ? <svg ref={donutRef} className="chart-svg" /> : <div className="hint">Employment type field not detected.</div>}
+        {/* Loading State */}
+        {loading && (
+          <div style={{
+            background: 'white',
+            padding: '3rem',
+            borderRadius: '16px',
+            textAlign: 'center',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+          }}>
+            <div style={{
+              width: '50px',
+              height: '50px',
+              border: '4px solid #f3f3f3',
+              borderTop: '4px solid #667eea',
+              borderRadius: '50%',
+              animation: 'spin 1s linear infinite',
+              margin: '0 auto 1rem'
+            }} />
+            <h3 style={{ color: '#2c3e50' }}>Loading jobs and building charts...</h3>
+            <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
           </div>
+        )}
 
-          <div className="card bar-card">
-            <h3>Average Salary by Job Role</h3>
-            {(fields.role && fields.salary) ? <svg ref={barRef} className="chart-svg" /> : <div className="hint">Job Role or Salary field not detected.</div>}
+        {/* Error State */}
+        {error && (
+          <div style={{
+            background: '#fff5f5',
+            border: '2px solid #fc8181',
+            padding: '1.5rem',
+            borderRadius: '12px',
+            color: '#c53030',
+            marginBottom: '2rem'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <span style={{ fontSize: '1.5rem' }}>⚠️</span>
+              <strong>{error}</strong>
+            </div>
           </div>
+        )}
 
-          <div className="card hist-card">
-            <h3>Salary Distribution</h3>
-            {fields.salary ? <svg ref={histRef} className="chart-svg" /> : <div className="hint">Salary field not detected or non-numeric.</div>}
-          </div>
+        {/* Results */}
+        {results && (
+          <>
+            {/* Statistics Cards */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gap: '1rem',
+              marginBottom: '2rem'
+            }}>
+              <StatCard icon="💼" label="Total Jobs" value={results.stats.totalJobs} color="#667eea" />
+              <StatCard icon="💰" label="Avg Salary" value={`$${results.stats.avgSalary.toLocaleString()}`} color="#4facfe" />
+              <StatCard icon="📈" label="Max Salary" value={`$${results.stats.maxSalary.toLocaleString()}`} color="#43e97b" />
+              <StatCard icon="🌍" label="Locations" value={results.stats.uniqueLocations} color="#fa709a" />
+              <StatCard icon="🏢" label="Companies" value={results.stats.uniqueCompanies} color="#764ba2" />
+            </div>
+
+            {/* Trend Charts */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr',
+              gap: '1.5rem',
+              marginBottom: '2rem'
+            }}>
+              {/* Job Count Trend */}
+              <div style={{
+                background: 'white',
+                padding: '1.5rem',
+                borderRadius: '16px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+              }}>
+                <h3 style={{ margin: '0 0 1rem 0', color: '#2c3e50' }}>📊 Job Postings Over Time</h3>
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart data={results.trendData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                    <XAxis dataKey="year" stroke="#666" />
+                    <YAxis stroke="#666" />
+                    <Tooltip 
+                      contentStyle={{ 
+                        background: '#fff', 
+                        border: '1px solid #ddd', 
+                        borderRadius: '8px' 
+                      }} 
+                    />
+                    <Legend />
+                    <Line 
+                      type="monotone" 
+                      dataKey="count" 
+                      stroke="#667eea" 
+                      strokeWidth={3} 
+                      name="Job Count"
+                      dot={{ fill: '#667eea', r: 5 }}
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+
+              {/* Salary Trend */}
+              <div style={{
+                background: 'white',
+                padding: '1.5rem',
+                borderRadius: '16px',
+                boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+              }}>
+                <h3 style={{ margin: '0 0 1rem 0', color: '#2c3e50' }}>💰 Salary Trends</h3>
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart data={results.trendData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e0e0e0" />
+                    <XAxis dataKey="year" stroke="#666" />
+                    <YAxis stroke="#666" tickFormatter={(v) => `$${(v/1000).toFixed(0)}K`} />
+                    <Tooltip 
+                      contentStyle={{ 
+                        background: '#fff', 
+                        border: '1px solid #ddd', 
+                        borderRadius: '8px' 
+                      }}
+                      formatter={(value) => `$${value.toLocaleString()}`}
+                    />
+                    <Legend />
+                    <Line 
+                      type="monotone" 
+                      dataKey="avgSalary" 
+                      stroke="#4facfe" 
+                      strokeWidth={3} 
+                      name="Avg Salary"
+                      dot={{ fill: '#4facfe', r: 5 }}
+                    />
+                    <Line 
+                      type="monotone" 
+                      dataKey="maxSalary" 
+                      stroke="#43e97b" 
+                      strokeWidth={2} 
+                      name="Max Salary"
+                      strokeDasharray="5 5"
+                    />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Job Entries Table */}
+            <div style={{
+              background: 'white',
+              borderRadius: '16px',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+              overflow: 'hidden'
+            }}>
+              <div style={{
+                background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                color: 'white',
+                padding: '1.5rem',
+              }}>
+                <h3 style={{ margin: 0, fontSize: '1.3rem' }}>
+                  📋 All Job Entries ({results.jobs.length})
+                </h3>
+              </div>
+              
+              <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
+                <table style={{ 
+                  width: '100%', 
+                  borderCollapse: 'collapse',
+                  fontSize: '0.9rem'
+                }}>
+                  <thead style={{ 
+                    position: 'sticky', 
+                    top: 0, 
+                    background: '#f8f9fa',
+                    borderBottom: '2px solid #dee2e6'
+                  }}>
+                    <tr>
+                      <th style={tableHeaderStyle}>ID</th>
+                      <th style={tableHeaderStyle}>Job Title</th>
+                      <th style={tableHeaderStyle}>Company</th>
+                      <th style={tableHeaderStyle}>Location</th>
+                      <th style={tableHeaderStyle}>Salary</th>
+                      <th style={tableHeaderStyle}>Year</th>
+                      <th style={tableHeaderStyle}>Experience</th>
+                      <th style={tableHeaderStyle}>Work Setting</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.jobs.map((job, idx) => (
+                      <tr 
+                        key={job.job_id || idx}
+                        style={{
+                          borderBottom: '1px solid #f1f3f5',
+                          transition: 'background 0.2s'
+                        }}
+                        onMouseEnter={(e) => e.currentTarget.style.background = '#f8f9fa'}
+                        onMouseLeave={(e) => e.currentTarget.style.background = 'white'}
+                      >
+                        <td style={tableCellStyle}>{job.job_id}</td>
+                        <td style={{...tableCellStyle, fontWeight: 600, color: '#2c3e50'}}>
+                          {job.job_title}
+                        </td>
+                        <td style={tableCellStyle}>
+                          {job.company?.company_name || 'N/A'}
+                        </td>
+                        <td style={tableCellStyle}>{job.location || 'N/A'}</td>
+                        <td style={{...tableCellStyle, fontWeight: 600, color: '#27ae60'}}>
+                          {job.min_salary ? `$${job.min_salary.toLocaleString()}` : 'N/A'}
+                        </td>
+                        <td style={tableCellStyle}>{job.work_year || 'N/A'}</td>
+                        <td style={tableCellStyle}>
+                          <span style={{
+                            background: '#e3f2fd',
+                            color: '#1976d2',
+                            padding: '0.25rem 0.5rem',
+                            borderRadius: '6px',
+                            fontSize: '0.85rem'
+                          }}>
+                            {job.experience_level || 'N/A'}
+                          </span>
+                        </td>
+                        <td style={tableCellStyle}>
+                          <span style={{
+                            background: getWorkSettingColor(job.work_setting),
+                            color: 'white',
+                            padding: '0.25rem 0.5rem',
+                            borderRadius: '6px',
+                            fontSize: '0.85rem'
+                          }}>
+                            {job.work_setting || 'N/A'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Footer Note */}
+        <div style={{
+          marginTop: '2rem',
+          padding: '1rem',
+          background: '#fff3e0',
+          borderRadius: '12px',
+          border: '1px solid #ffb74d',
+          color: '#e65100',
+          fontSize: '0.9rem'
+        }}>
+          <strong>Note:</strong> This visualization fetches up to 10,000 jobs from <code>/jobs</code> endpoint and filters them based on your search criteria.
         </div>
-      )}
-
-      <footer className="analytics-footer small">
-        Note: this visualization fetches up to {MAX_FETCH} jobs from <code>/jobs</code>.
-      </footer>
+      </div>
     </div>
   );
 }
 
-/* ---------- Drawing Helpers (with Animations) ---------- */
-
-function drawDonut(ref, data, opts = {}) {
-  const svgEl = ref.current || ref;
-  if (!svgEl) return;
-  const width = 560,
-    height = 360,
-    radius = Math.min(width, height) / 2 - 12;
-  const svg = d3.select(svgEl);
-  svg.attr("viewBox", `0 0 ${width} ${height}`);
-  svg.selectAll("*").remove();
-
-  if (!data || data.length === 0) {
-    svg
-      .append("text")
-      .attr("x", width / 2)
-      .attr("y", height / 2)
-      .attr("text-anchor", "middle")
-      .attr("class", "hint")
-      .text("No data");
-    return;
-  }
-
-  const g = svg
-    .append("g")
-    .attr("transform", `translate(${width / 2},${height / 2})`);
-  const color = d3
-    .scaleOrdinal()
-    .domain(data.map((d) => d.label))
-    .range(d3.schemeTableau10);
-
-  const pie = d3
-    .pie()
-    .sort(null)
-    .value((d) => d.value); // Use 'value'
-  const arc = d3.arc().innerRadius(radius * 0.55).outerRadius(radius);
-  g
-    .selectAll("path")
-    .data(pie(data))
-    .enter()
-    .append("path")
-    .attr("fill", (d) => color(d.data.label))
-    .attr("stroke", "#fff")
-    .attr("stroke-width", 2)
-    .on("mouseenter", function (e, d) {
-      d3.select(this).transition().duration(150).attr("transform", "scale(1.03)");
-      showTooltip(svgEl, `${d.data.label}: ${d.data.value}`);
-    })
-    .on("mouseleave", function () {
-      d3.select(this).transition().duration(150).attr("transform", "scale(1)");
-      hideTooltip(svgEl);
-    })
-    .transition()
-    .duration(750)
-    .delay((d, i) => i * 50)
-    .attrTween("d", (d) => {
-      const i = d3.interpolate({ startAngle: d.startAngle, endAngle: d.startAngle }, d);
-      return (t) => arc(i(t));
-    });
-
-  g.append("text")
-    .attr("text-anchor", "middle")
-    .attr("dy", "0.3em")
-    .attr("class", "donut-center")
-    .text(d3.sum(data, (d) => d.value)); // Use 'value'
-
-  const legend = svg
-    .append("g")
-    .attr("transform", `translate(12, 24)`);
-  const legendItems = legend
-    .selectAll("g")
-    .data(data.slice(0, 10))
-    .enter()
-    .append("g")
-    .attr("transform", (d, i) => `translate(0,${i * 20})`);
-  legendItems
-    .append("rect")
-    .attr("width", 14)
-    .attr("height", 14)
-    .attr("rx", 3)
-    .attr("fill", (d) => color(d.label));
-  legendItems
-    .append("text")
-    .attr("x", 18)
-    .attr("y", 12)
-    .text((d) => `${d.label} (${d.value})`) // Use 'value'
-    .attr("class", "legend-item");
+// Helper Components
+function StatCard({ icon, label, value, color }) {
+  return (
+    <div style={{
+      background: 'white',
+      padding: '1.5rem',
+      borderRadius: '12px',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.1)',
+      borderLeft: `4px solid ${color}`
+    }}>
+      <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>{icon}</div>
+      <div style={{ fontSize: '0.85rem', color: '#7f8c8d', marginBottom: '0.25rem' }}>
+        {label}
+      </div>
+      <div style={{ fontSize: '1.5rem', fontWeight: 700, color: '#2c3e50' }}>
+        {value}
+      </div>
+    </div>
+  );
 }
 
-function drawHorizontalBar(element, data, opts = {}) {
-  const svgEl = element;
-  if (!svgEl) return;
-  const width = 520,
-    height = 420;
-  const margin = { top: 26, right: 20, bottom: 40, left: 160 };
-  const svg = d3.select(svgEl);
-  svg.attr("viewBox", `0 0 ${width} ${height}`);
-  svg.selectAll("*").remove();
+// Styles
+const tableHeaderStyle = {
+  padding: '1rem',
+  textAlign: 'left',
+  fontWeight: 600,
+  color: '#495057',
+  textTransform: 'uppercase',
+  fontSize: '0.75rem',
+  letterSpacing: '0.5px'
+};
 
-  if (!data || data.length === 0) {
-    svg
-      .append("text")
-      .attr("x", width / 2)
-      .attr("y", height / 2)
-      .attr("text-anchor", "middle")
-      .attr("class", "hint")
-      .text("No data");
-    return;
-  }
+const tableCellStyle = {
+  padding: '1rem',
+  color: '#495057'
+};
 
-  // REFACTORED: Use 'd.value'
-  const max = d3.max(data, (d) => d.value) || 1;
-  const y = d3
-    .scaleBand()
-    .domain(data.map((d) => d.label).reverse())
-    .range([margin.top, height - margin.bottom])
-    .padding(0.15);
-  const x = d3
-    .scaleLinear()
-    .domain([0, max])
-    .nice()
-    .range([margin.left, width - margin.right]);
-
-  svg
-    .append("g")
-    .selectAll("rect")
-    .data(data)
-    .join("rect")
-    .attr("y", (d) => y(d.label))
-    .attr("height", y.bandwidth())
-    .attr("class", "bar")
-    .attr("x", margin.left)
-    .attr("width", 0)
-    .transition()
-    .duration(750)
-    .delay((d, i) => i * 30)
-    .attr("width", (d) => Math.max(0, x(d.value) - margin.left)); // Use 'd.value'
-
-  svg
-    .append("g")
-    .attr("class", "y-axis")
-    .attr("transform", `translate(${margin.left - 6},0)`)
-    .call(d3.axisLeft(y).tickSize(0))
-    .call((g) => g.select(".domain").remove());
-
-  svg
-    .append("g")
-    .attr("class", "x-axis")
-    .attr("transform", `translate(0,${height - margin.bottom})`)
-    .call(d3.axisBottom(x).ticks(6).tickSizeOuter(0));
-
-  svg
-    .append("text")
-    .attr("x", width / 2)
-    .attr("y", 18)
-    .attr("text-anchor", "middle")
-    .attr("class", "chart-title")
-    .text(opts.title || "Bar");
-}
-
-function drawHistogram(element, values, opts = {}) {
-  const svgEl = element;
-  if (!svgEl) return;
-  const width = 900,
-    height = 420;
-  const margin = { top: 28, right: 14, bottom: 80, left: 60 };
-  const svg = d3.select(svgEl);
-  svg.attr("viewBox", `0 0 ${width} ${height}`);
-  svg.selectAll("*").remove();
-
-  if (!values || values.length === 0) {
-    svg
-      .append("text")
-      .attr("x", width / 2)
-      .attr("y", height / 2)
-      .attr("text-anchor", "middle")
-      .attr("class", "hint")
-      .text("No numeric salary data");
-    return;
-  }
-
-  const buckets = opts.buckets || 20;
-  const x = d3
-    .scaleLinear()
-    .domain(d3.extent(values))
-    .nice()
-    .range([margin.left, width - margin.right]);
-  const histogram = d3
-    .bin()
-    .domain(x.domain())
-    .thresholds(buckets)(values);
-  const y = d3
-    .scaleLinear()
-    .domain([0, d3.max(histogram, (d) => d.length)])
-    .nice()
-    .range([height - margin.bottom, margin.top]);
-
-  svg
-    .append("g")
-    .selectAll("rect")
-    .data(histogram)
-    .join("rect")
-    .attr("x", (d) => x(d.x0) + 1)
-    .attr("width", (d) => Math.max(0, x(d.x1) - x(d.x0) - 1))
-    .attr("class", "bar")
-    .attr("y", y(0))
-    .attr("height", 0)
-    .transition()
-    .duration(750)
-    .delay((d, i) => i * 20)
-    .attr("y", (d) => y(d.length))
-    .attr("height", (d) => Math.max(0, y(0) - y(d.length)));
-
-  svg
-    .append("g")
-    .attr("class", "x-axis")
-    .attr("transform", `translate(0,${height - margin.bottom})`)
-    .call(
-      d3.axisBottom(x).ticks(8).tickFormat(d3.format(",.0f")).tickSizeOuter(0)
-    )
-    .selectAll("text")
-    .attr("transform", "rotate(-45)")
-    .style("text-anchor", "end");
-
-  svg
-    .append("g")
-    .attr("class", "y-axis")
-    .attr("transform", `translate(${margin.left},0)`)
-    .call(d3.axisLeft(y).ticks(6));
-
-  svg
-    .append("text")
-    .attr("x", width / 2)
-    .attr("y", 18)
-    .attr("text-anchor", "middle")
-    .attr("class", "chart-title")
-    .text(opts.title || "Histogram");
-}
-
-/* ---------- simple tooltip helpers (DOM) ---------- */
-function showTooltip(svgEl, text) {
-  let root = svgEl.ownerDocument || document;
-  let tip = root.getElementById("__analytics_tooltip");
-  if (!tip) {
-    tip = root.createElement("div");
-    tip.id = "__analytics_tooltip";
-    tip.style.position = "fixed";
-    tip.style.pointerEvents = "none";
-    tip.style.padding = "6px 8px";
-    tip.style.background = "rgba(0,0,0,0.75)";
-    tip.style.color = "#fff";
-    tip.style.borderRadius = "6px";
-    tip.style.fontSize = "12px";
-    tip.style.zIndex = "100";
-    root.body.appendChild(tip);
-  }
-  tip.textContent = text;
-  tip.style.display = "block";
-  // crude position
-  tip.style.left = (window.innerWidth * 0.5) + "px";
-  tip.style.top = (window.innerHeight * 0.2) + "px";
-}
-
-function hideTooltip(svgEl) {
-  const tip = document.getElementById("__analytics_tooltip");
-  if (tip) tip.style.display = "none";
+function getWorkSettingColor(setting) {
+  const colors = {
+    'Remote': '#1abc9c',
+    'Hybrid': '#e67e22',
+    'In-person': '#e74c3c'
+  };
+  return colors[setting] || '#95a5a6';
 }
